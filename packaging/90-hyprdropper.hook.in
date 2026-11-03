@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = hyprland
+
+[Action]
+Description = Rebuilding hyprdropper for the new Hyprland...
+When = PostTransaction
+Depends = util-linux
+Exec = /usr/bin/runuser -u @USER@ -- /usr/bin/env HOME=@HOME@ XDG_CONFIG_HOME=@XDG_CONFIG_HOME@ @REPO@/scripts/rebuild.sh

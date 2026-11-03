@@ -1,0 +1,12 @@
+[repository]
+name = "hyprdropper"
+authors = ["oblivion8282-1337"]
+commit_pins = []
+
+[hyprdropper]
+description = "niri-like drag & drop for the scrolling layout: nothing jumps while dragging, an insert bar shows where the window lands"
+authors = ["oblivion8282-1337"]
+output = "build/hyprdropper.so"
+build = [
+    "make all",
+]

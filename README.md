@@ -78,7 +78,6 @@ hl.config({
             col             = { bar = "rgba(42a5f5ff)" }, -- own colour
             bar_width       = 6,      -- px
             bar_animation   = true,   -- grow-in + breathing glow
-            bar_grow_ms     = 500,    -- grow-in duration
             glow_strength   = 1.0,    -- soft halo around the bar, 0 = off
             neighbor_glow   = true,   -- light up the borders of the windows next to the bar
             -- dragged window
@@ -102,6 +101,21 @@ hyprlang config: `plugin { hyprdropper { glow_strength = 0.6 } }`.
 `col.bar` uses that colour; an explicitly set `use_theme_color` always decides.
 
 How far the mouse has to move before a click becomes a drag is Hyprland's `binds.drag_threshold`.
+
+## Animations
+
+The shrinking of the dragged window and the bar's grow-in/glide run on Hyprland's animation system, on own
+leaves that inherit from `windows` (so by default they move like your windows). `animations.enabled = false`
+turns them off as well. Tune them like any other animation:
+
+```lua
+hl.animation({ leaf = "hyprdropper",      speed = 4, bezier = "default" })   -- both
+hl.animation({ leaf = "hyprdropperScale", speed = 3, bezier = "myCurve" })   -- window shrink / grow back
+hl.animation({ leaf = "hyprdropperBar",   speed = 5, bezier = "default" })   -- bar grow-in and glide
+```
+
+The landing flight uses Hyprland's normal `windowsMove` animation; the breathing glow is a loop and not part of
+the animation tree (`bar_animation = false` turns grow-in and breathing off).
 
 ## Version safety
 

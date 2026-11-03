@@ -648,6 +648,31 @@ def t_color_source(I):
     check("after reload: back to theme", st.get("bar_color", "").startswith("theme"), st.get("bar_color"))
 
 
+def t_animation_leaves(I):
+    I.reset()
+    anims = I.ctl("animations")
+    check("own animation leaves exist", all(f"name: {n}" in anims for n in ("hyprdropper", "hyprdropperScale", "hyprdropperBar")), anims[-300:])
+    r = I.ctl("eval hl.animation({ leaf = 'hyprdropperScale', enabled = true, speed = 20, bezier = 'default' })")
+    check("hl.animation accepts our leaf", r == "ok", r)
+    I.eval("hl.config({ animations = { enabled = true } })")
+    o = I.order()
+    begin_drag(I, o[0])
+    time.sleep(0.15)  # speed 20 = 2 s for the whole shrink, so we must be mid-way
+    st = I.status()
+    sc = float(st.get("scale", "1 -> 1").split()[0]) if "scale" in st else 1.0
+    check("shrink runs on the hyprdropperScale curve (mid-way)", 0.6 < sc < 1.0, st.get("scale"))
+    I.eval("hl.plugin.test.keybind(1, 0, 9)")
+    I.eval("hl.plugin.test.keybind(0, 0, 9)")
+    I.release()
+    time.sleep(2.5)
+    check("scaler retired after the slow grow-back", I.status().get("scalers") == "0", I.status())
+    I.ctl("reload")  # drops the override and turns animations off again (test config)
+    time.sleep(0.3)
+    anims = I.ctl("animations")
+    blk = anims[anims.find("name: hyprdropperScale"):][:200]
+    check("reload drops removed overrides", "speed: 0.00" in blk or "overriden: 0" in blk or "enabled: -1" in blk, blk)
+
+
 SCENARIOS = [
     t_nothing_moves_and_new_column_after,
     t_into_column,
@@ -671,6 +696,7 @@ SCENARIOS = [
     t_bar_jumps_between_targets,
     t_neighbor_glow,
     t_color_source,
+    t_animation_leaves,
     t_version_gate,
 ]
 

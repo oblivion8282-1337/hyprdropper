@@ -78,7 +78,6 @@ hl.config({
             col             = { bar = "rgba(42a5f5ff)" }, -- eigene Farbe
             bar_width       = 6,      -- Dicke in px
             bar_animation   = true,   -- Aufziehen + atmendes Leuchten
-            bar_grow_ms     = 500,    -- Dauer des Aufziehens in ms
             glow_strength   = 1.0,    -- weicher Lichthof um den Balken, 0 = aus
             neighbor_glow   = true,   -- Rahmen der Nachbarfenster leuchten auf
             -- gezogenes Fenster
@@ -102,6 +101,21 @@ hyprlang-Config: `plugin { hyprdropper { glow_strength = 0.6 } }`.
 setzt, bekommt diese Farbe; ein ausdrücklich gesetztes `use_theme_color` entscheidet immer.
 
 Ab wann ein Klick zum Ziehen wird, regelt Hyprlands `binds.drag_threshold`.
+
+## Animationen
+
+Das Verkleinern des gezogenen Fensters sowie Aufziehen und Gleiten des Balkens laufen über Hyprlands
+Animationssystem, auf eigenen Einträgen unter `windows` (standardmäßig bewegen sie sich also wie deine Fenster).
+`animations.enabled = false` schaltet sie mit ab. Einstellen wie jede andere Animation:
+
+```lua
+hl.animation({ leaf = "hyprdropper",      speed = 4, bezier = "default" })   -- beides
+hl.animation({ leaf = "hyprdropperScale", speed = 3, bezier = "meineKurve" }) -- Fenster verkleinern / zurückwachsen
+hl.animation({ leaf = "hyprdropperBar",   speed = 5, bezier = "default" })   -- Balken aufziehen und gleiten
+```
+
+Der Landeflug nutzt Hyprlands normale `windowsMove`-Animation; das atmende Leuchten ist eine Schleife und nicht
+Teil des Animationsbaums (`bar_animation = false` schaltet Aufziehen und Atmen ab).
 
 ## Versionssicherheit
 

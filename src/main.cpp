@@ -52,6 +52,8 @@
 #include <hyprland/src/render/transformer/Transformer.hpp>
 #include <hyprland/src/render/transformer/TransformerList.hpp>
 #include <hyprland/src/desktop/view/window/WindowEffectsController.hpp>
+#include <hyprland/src/animation/AnimationManager.hpp>
+#include <hyprland/src/helpers/AnimatedVariable.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/workspace/HLWorkspace.hpp>
 
@@ -59,6 +61,7 @@
 // primitives Hyprland itself uses for drops.
 #define private public
 #include <hyprland/src/layout/algorithm/tiled/scrolling/ScrollingAlgorithm.hpp>
+#include <hyprland/src/config/shared/animation/AnimationTree.hpp> // createNode() for our own animation leaves
 #undef private
 
 #include "DropLogic.hpp"
@@ -87,7 +90,6 @@ static struct {
     SP<Config::Values::CFloatValue> dragScale;
     SP<Config::Values::CBoolValue>  showGap;
     SP<Config::Values::CBoolValue>  barAnimation;
-    SP<Config::Values::CIntValue>   barGrowMs;
     SP<Config::Values::CBoolValue>  neighborGlow;
     SP<Config::Values::CFloatValue> glowStrength;
 } g_cfg;
@@ -123,7 +125,6 @@ static struct {
     std::optional<CBox>      barShown;
     std::string              barKey;     // identity of the drop target the goal belongs to
     std::string              barShownKey;
-    std::chrono::steady_clock::time_point barAppear; // when the bar jumped to its current target (grow-in)
     std::chrono::steady_clock::time_point liftTime;  // phase origin for the breathing glow
 
     // windows next to the insertion point and the edge that faces the bar: they get lit up
@@ -246,6 +247,46 @@ static void damageBar(const std::optional<CBox>& b) {
     g_pHyprRenderer->damageBox(b->copy().expand(HALO_RANGE_DAMAGE));
 }
 
+// ---------------------------------------------------------------- animations (Hyprland's animation system)
+//
+// Own leaves in Hyprland's animation tree, so they follow the user's curves/speeds and animations.enabled:
+//   hyprdropper            (inherits "windows")
+//   ├─ hyprdropperScale    shrinking/growing of the dragged window
+//   └─ hyprdropperBar      grow-in and gliding of the insert bar
+// e.g. hl.animation({ leaf = "hyprdropperBar", speed = 4, bezier = "myCurve" })
+
+static const char* ANIM_ROOT  = "hyprdropper";
+static const char* ANIM_SCALE = "hyprdropperScale";
+static const char* ANIM_BAR   = "hyprdropperBar";
+
+// (re)create our leaves; on a config reload this also drops overrides that were removed from the config
+static void registerAnimationLeaves() {
+    auto& tree = Config::animationTree()->m_animationTree;
+    tree.createNode(ANIM_ROOT, "windows");
+    tree.createNode(ANIM_SCALE, ANIM_ROOT);
+    tree.createNode(ANIM_BAR, ANIM_ROOT);
+}
+
+static SP<Hyprutils::Animation::SAnimationPropertyConfig> animConfig(const char* leaf) {
+    return Config::animationTree()->getAnimationPropertyConfig(leaf);
+}
+
+// the insert bar as an animated position/size plus a 0..1 grow-in factor
+static PHLANIMVAR<Vector2D> g_barPos, g_barSize;
+static PHLANIMVAR<float>    g_barGrow;
+
+static void createBarAnimations() {
+    Animation::mgr()->createAnimation(Vector2D{}, g_barPos, animConfig(ANIM_BAR), AVARDAMAGE_NONE);
+    Animation::mgr()->createAnimation(Vector2D{}, g_barSize, animConfig(ANIM_BAR), AVARDAMAGE_NONE);
+    Animation::mgr()->createAnimation(1.F, g_barGrow, animConfig(ANIM_BAR), AVARDAMAGE_NONE);
+}
+
+static void destroyBarAnimations() {
+    g_barPos.reset();
+    g_barSize.reset();
+    g_barGrow.reset();
+}
+
 // ---------------------------------------------------------------- scale transformer
 //
 // Draws the dragged window scaled around the grab point. Hyprland renders the window into a buffer and
@@ -255,17 +296,23 @@ static void damageBar(const std::optional<CBox>& b) {
 
 class CDragScaleTransformer;
 static std::vector<CDragScaleTransformer*> g_scalers;
-static wl_event_source*                    g_animTimer = nullptr;
-static std::chrono::steady_clock::time_point g_animLast;
-static void                                ensureAnimTimer();
+static void                                onScalerIdle(void* data);
 
 class CDragScaleTransformer : public Render::IWindowTransformer {
   public:
     CDragScaleTransformer(PHLWINDOWREF window, Vector2D frac) : m_window(window), m_frac(frac) {
         g_scalers.push_back(this);
+        Animation::mgr()->createAnimation(1.F, m_scale, animConfig(ANIM_SCALE), AVARDAMAGE_NONE);
+        // the variable belongs to this object, so the callback can never outlive it
+        m_scale->setUpdateCallback([this](auto) {
+            if (const auto W = m_window.lock(); W)
+                g_pHyprRenderer->damageWindow(W, true);
+        });
     }
     virtual ~CDragScaleTransformer() {
         std::erase(g_scalers, this);
+        if (m_idle)
+            wl_event_source_remove(m_idle);
     }
 
     virtual Render::SWindowTransformBuffer transform(Render::CRenderContext&, const Render::SWindowTransformBuffer& in, const Render::SWindowTransformContext& ctx) {
@@ -296,35 +343,32 @@ class CDragScaleTransformer : public Render::IWindowTransformer {
         return inputBox;
     }
 
+    double scale() const {
+        return m_scale ? m_scale->value() : 1.0;
+    }
+    double target() const {
+        return m_scale ? m_scale->goal() : 1.0;
+    }
     bool isIdentity() const {
-        return std::abs(m_scale - 1.0) < 0.0005;
+        return std::abs(scale() - 1.0) < 0.0005;
     }
     CBox scaleAround(const CBox& b, const Vector2D& a) const {
-        return {a.x + (b.x - a.x) * m_scale, a.y + (b.y - a.y) * m_scale, b.w * m_scale, b.h * m_scale};
-    }
-
-    // returns true while still animating
-    bool step(double dt) {
-        const auto W = m_window.lock();
-        if (!W || !m_alive)
-            return false;
-        if (m_scale == m_target) {
-            if (m_target >= 1.0)
-                retire(W);
-            return false;
-        }
-        g_pHyprRenderer->damageWindow(W, true);
-        constexpr double TAU = 0.06; // ~ 200 ms to settle
-        m_scale = m_target + (m_scale - m_target) * std::exp(-dt / TAU);
-        if (std::abs(m_scale - m_target) < 0.002)
-            m_scale = m_target;
-        g_pHyprRenderer->damageWindow(W, true);
-        return true;
+        const double S = scale();
+        return {a.x + (b.x - a.x) * S, a.y + (b.y - a.y) * S, b.w * S, b.h * S};
     }
 
     void setTarget(double t) {
-        m_target = std::clamp(t, 0.1, 1.0);
-        ensureAnimTimer();
+        if (const auto W = m_window.lock(); W)
+            g_pHyprRenderer->damageWindow(W, true);
+        *m_scale = sc<float>(std::clamp(t, 0.1, 1.0));
+        // Register the end callback only after setting the goal: Hyprland calls it immediately if the
+        // variable is not animating (e.g. animations disabled). Once back at full size we are not needed
+        // anymore: retire on the next loop turn, never from inside the variable's callback (retiring
+        // destroys the variable).
+        m_scale->setCallbackOnEnd([this](auto) {
+            if (m_scale->goal() >= 1.F && !m_idle)
+                m_idle = wl_event_loop_add_idle(g_pCompositor->m_wlEventLoop, onScalerIdle, this);
+        });
     }
 
     // deactivate and let Hyprland drop us; never touch `this` afterwards
@@ -335,12 +379,23 @@ class CDragScaleTransformer : public Render::IWindowTransformer {
         w->effects().transformers()->removeInactive(); // deletes this
     }
 
-    PHLWINDOWREF m_window;
-    Vector2D     m_frac;
-    double       m_scale  = 1.0;
-    double       m_target = 1.0;
-    bool         m_alive  = true;
+    PHLWINDOWREF      m_window;
+    Vector2D          m_frac;
+    PHLANIMVAR<float> m_scale;
+    wl_event_source*  m_idle  = nullptr;
+    bool              m_alive = true;
 };
+
+static void onScalerIdle(void* data) {
+    auto* s = sc<CDragScaleTransformer*>(data);
+    if (std::ranges::find(g_scalers, s) == g_scalers.end())
+        return; // already gone
+    s->m_idle = nullptr; // a one-shot idle source is freed by the event loop after this call
+    if (s->target() >= 1.0 && !s->m_scale->isBeingAnimated()) {
+        if (const auto W = s->m_window.lock(); W)
+            s->retire(W);
+    }
+}
 
 static CDragScaleTransformer* scalerFor(const PHLWINDOW& w) {
     for (auto* s : g_scalers) {
@@ -350,44 +405,7 @@ static CDragScaleTransformer* scalerFor(const PHLWINDOW& w) {
     return nullptr;
 }
 
-static int onAnimTick(void*) {
-    CPerfScope perf{PERF_ANIM};
-    const auto NOW = std::chrono::steady_clock::now();
-    const auto DT  = std::min(std::chrono::duration<double>(NOW - g_animLast).count(), 0.05);
-    g_animLast     = NOW;
-
-    bool       more = false;
-    // step() may retire (and delete) a scaler, so iterate over a copy
-    for (auto* s : std::vector<CDragScaleTransformer*>(g_scalers)) {
-        if (std::ranges::find(g_scalers, s) == g_scalers.end())
-            continue;
-        if (s->step(DT))
-            more = true;
-    }
-
-    if (more)
-        wl_event_source_timer_update(g_animTimer, 8);
-    else {
-        wl_event_source_remove(g_animTimer);
-        g_animTimer = nullptr;
-    }
-    return 0;
-}
-
-static void ensureAnimTimer() {
-    if (g_animTimer)
-        return;
-    g_animLast  = std::chrono::steady_clock::now();
-    g_animTimer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, onAnimTick, nullptr);
-    if (g_animTimer)
-        wl_event_source_timer_update(g_animTimer, 1);
-}
-
 static void removeAllScalers() {
-    if (g_animTimer) {
-        wl_event_source_remove(g_animTimer);
-        g_animTimer = nullptr;
-    }
     for (auto* s : std::vector<CDragScaleTransformer*>(g_scalers)) {
         const auto W = s->m_window.lock();
         if (W)
@@ -595,20 +613,23 @@ static void updateBar() {
     if (!g_drag.barGoal) {
         g_drag.barShown.reset();
     } else if (!g_drag.barShown || g_drag.barShownKey != g_drag.barKey) {
-        g_drag.barShown    = g_drag.barGoal; // appear or new target: jump, never travel across windows
+        // appear or new target: jump (never travel across windows) and grow in
+        g_barPos->setValueAndWarp(g_drag.barGoal->pos());
+        g_barSize->setValueAndWarp(g_drag.barGoal->size());
+        if (g_cfg.barAnimation->value()) {
+            g_barGrow->setValueAndWarp(0.F);
+            *g_barGrow = 1.F;
+        } else
+            g_barGrow->setValueAndWarp(1.F);
         g_drag.barShownKey = g_drag.barKey;
-        g_drag.barAppear   = std::chrono::steady_clock::now();
+        g_drag.barShown    = CBox{g_barPos->value(), g_barSize->value()};
     } else {
-        // glide towards the goal
-        auto&           s = *g_drag.barShown;
-        const auto&     g = *g_drag.barGoal;
-        constexpr float K = 0.35F;
-        s.x += (g.x - s.x) * K;
-        s.y += (g.y - s.y) * K;
-        s.w += (g.w - s.w) * K;
-        s.h += (g.h - s.h) * K;
-        if (std::abs(s.x - g.x) < 0.5 && std::abs(s.y - g.y) < 0.5 && std::abs(s.w - g.w) < 0.5 && std::abs(s.h - g.h) < 0.5)
-            s = g;
+        // same target moved (e.g. the tape scrolls): glide there with Hyprland's animation
+        if (g_barPos->goal() != g_drag.barGoal->pos())
+            *g_barPos = g_drag.barGoal->pos();
+        if (g_barSize->goal() != g_drag.barGoal->size())
+            *g_barSize = g_drag.barGoal->size();
+        g_drag.barShown = CBox{g_barPos->value(), g_barSize->value()};
     }
 
     if (OLD != g_drag.barShown) {
@@ -1091,11 +1112,9 @@ static double pulsePhase() {
 }
 
 static double appearAlpha() {
-    if (!g_cfg.barAnimation->value())
+    if (!g_cfg.barAnimation->value() || !g_barGrow)
         return 1.0;
-    const double APP = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_drag.barAppear).count();
-    const double DUR = std::max<Config::INTEGER>(g_cfg.barGrowMs->value(), 1) / 1000.0;
-    return std::clamp(APP / DUR * 3.0, 0.0, 1.0);
+    return std::clamp(g_barGrow->value() * 3.0, 0.0, 1.0);
 }
 
 // Soft light around the insert bar, drawn with Hyprland's own (gaussian-like) shadow shader in the accent
@@ -1140,15 +1159,12 @@ static constexpr double HALO_RANGE = 42.0; // logical px
 // per monitor: halo already emitted in the current frame (the dragged window renders twice: main + popup pass)
 static std::vector<PHLMONITORREF> g_haloThisFrame;
 
-// the bar as drawn right now: grows from its centre along its length on a new target (easeOutCubic, no overshoot)
+// the bar as drawn right now: grows from its centre along its length on a new target
 static CBox barVisualBox() {
     CBox box = *g_drag.barShown;
-    if (!g_cfg.barAnimation->value())
+    if (!g_cfg.barAnimation->value() || !g_barGrow)
         return box;
-    const double APP = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_drag.barAppear).count();
-    const double DUR = std::max<Config::INTEGER>(g_cfg.barGrowMs->value(), 1) / 1000.0;
-    const double P   = std::clamp(APP / DUR, 0.0, 1.0);
-    const double K   = 1.0 - std::pow(1.0 - P, 3);
+    const double K = std::clamp<double>(g_barGrow->value(), 0.0, 1.0); // curve comes from the hyprdropperBar leaf
     if (box.h >= box.w) {
         const double H = box.h * K;
         box.y += (box.h - H) / 2.0;
@@ -1393,9 +1409,12 @@ static std::string statusString() {
     if (const auto W = g_drag.window.lock(); W) {
         s += std::format("offset: {} {}\n", W->presentation().floatingOffset().x, W->presentation().floatingOffset().y);
         if (auto* S = scalerFor(W); S)
-            s += std::format("scale: {:.3f} -> {:.3f}\n", S->m_scale, S->m_target);
+            s += std::format("scale: {:.3f} -> {:.3f}\n", S->scale(), S->target());
     }
     s += std::format("scalers: {}\n", g_scalers.size());
+    for (auto* sc_ : g_scalers)
+        s += std::format("scaler: value {:.3f} goal {:.3f} animating {} idle {} alive {}\n", sc_->scale(), sc_->target(), sc_->m_scale->isBeingAnimated(), sc_->m_idle != nullptr,
+                         sc_->m_alive);
     s += std::format("neighbors: {}\n", g_drag.neighborsShown.size());
     if (g_hooksActive) {
         const auto C = barColor();
@@ -1458,11 +1477,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_cfg.glowStrength = makeShared<Config::Values::CFloatValue>("plugin:hyprdropper:glow_strength", "strength of the soft light around the insert bar (1 = default)", 1.F,
                                                                  Config::Values::SFloatValueOptions{.min = 0.F, .max = 3.F});
     g_cfg.neighborGlow = makeShared<Config::Values::CBoolValue>("plugin:hyprdropper:neighbor_glow", "light up the windows next to the insert bar", true);
-    g_cfg.barGrowMs    = makeShared<Config::Values::CIntValue>("plugin:hyprdropper:bar_grow_ms", "duration of the bar's grow-in (ms)", 500,
-                                                               Config::Values::SIntValueOptions{.min = 1, .max = 3000});
     for (const auto& v : std::vector<SP<Config::Values::IValue>>{g_cfg.enabled, g_cfg.color, g_cfg.useThemeColor, g_cfg.barWidth, g_cfg.edgeSize, g_cfg.edgeSpeed, g_cfg.wheelStep, g_cfg.dragOpacity,
-                                                                 g_cfg.dragScale, g_cfg.showGap, g_cfg.barAnimation, g_cfg.barGrowMs, g_cfg.neighborGlow, g_cfg.glowStrength})
+                                                                 g_cfg.dragScale, g_cfg.showGap, g_cfg.barAnimation, g_cfg.neighborGlow, g_cfg.glowStrength})
         HyprlandAPI::addConfigValueV2(PHANDLE, v);
+
+    registerAnimationLeaves();
+    createBarAnimations();
+    g_listeners.push_back(Event::bus()->m_events.config.preReload.listen([] { registerAnimationLeaves(); }));
 
     g_ctlCommand = HyprlandAPI::registerHyprCtlCommand(PHANDLE, IPC::Socket1::SCommand{.name = "hyprdropper", .match = IPC::Socket1::COMMAND_MATCH_EXACT,
                                                                                          .handler = [](const IPC::Socket1::SRequest&) { return IPC::Socket1::SResponse{statusString()}; }});
@@ -1517,6 +1538,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     }));
 
     g_hooksActive = true;
+
+    // the config was parsed before we existed: parse it again so options and hl.animation() lines for our
+    // leaves (hyprdropper, hyprdropperScale, hyprdropperBar) apply right away
+    HyprlandAPI::reloadConfig();
     return INFO;
 }
 
@@ -1525,6 +1550,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
         endOurDrag(true);
     resetState();
     removeAllScalers();
+    destroyBarAnimations();
     g_hooksActive = false;
     g_listeners.clear();
     if (g_ctlCommand)
